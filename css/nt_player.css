@@ -1,0 +1,10 @@
+/* 
+    Document   : nt_player
+    Created on : 17-May-2012, 16:35:46
+    Author     : John-Paul Drawneek <jdrawneek@nationaltheatre.org.uk>
+    Description:
+        Purpose of the stylesheet follows.
+*/
+.audio .mejs-overlay-button {
+    background-image: url('audio_icon.png');
+}

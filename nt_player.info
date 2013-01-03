@@ -1,0 +1,9 @@
+name = NT Player
+description = "Display NT videos and image galleries"
+package = NT
+core = 7.x
+version = 7.x-1.0-dev
+scripts[] = js/mediaelement-and-player.min.js
+;scripts[] = js/nt_player.js
+stylesheets[all][] = css/mediaelementplayer.min.css
+stylesheets[all][] = css/nt_player.css

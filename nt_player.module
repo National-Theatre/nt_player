@@ -1,0 +1,961 @@
+<?php
+/**
+ * @file
+ * Display NT videos and image galleries
+ *
+ * PLAYER TODOS:
+ * 1. handling of when a file doesn't exist:
+ * - a video format on the RM server - using is_file()
+ * - an image thumb/poster
+ * 2. background image for player
+ * 3. make link class active when you've selected that item
+ */
+
+/**
+ * nt_player_addjs
+ *
+ * @param string $player_id
+ *   Id of the player
+ */
+function nt_player_addjs($player_id = 'player1') {
+  global $base_url;
+  $path = $base_url . '/' . drupal_get_path('module', 'nt_player');
+  $data = <<<EOD
+jQuery(document).ready(function() {
+  var player = new MediaElementPlayer('#$player_id', {
+        features: ['playpause','current','progress','duration','volume'],
+        plugins: ['flash'],
+        pluginPath: '$path/swf/',
+        flashName: 'flashmediaelement.swf',
+        success: function(media, node, player) {
+          var flag = false;
+          media.addEventListener('play', function(e) {
+            console.log(flag);
+            if (!flag) {
+              var ext = player.media.currentSrc.split('.').pop().toLowerCase();
+              var type = 'unknown';
+              if (ext == 'mp4' || ext == 'webm') {
+                type = 'video';
+              } else if (ext == 'mp3' || ext == 'ogg') {
+                type = 'audio';
+              }
+              _gaq.push(['_trackEvent', type, 'plays', player.media.currentSrc]);
+            }
+            flag = true;
+          });
+        }
+  });
+  if (!Drupal.settings.hasOwnProperty('nt_player')) {
+    Drupal.settings.nt_player = {};
+  }
+  if (!Drupal.settings.nt_player.hasOwnProperty('players')) {
+    Drupal.settings.nt_player.players = {};
+  }
+  jQuery.extend(
+    Drupal.settings.nt_player.players,
+    {
+      $player_id: player
+    }
+  );
+});
+EOD;
+
+  drupal_add_js($data, array('type' => 'inline', 'scope' => 'header'));
+}
+
+/**
+ * nt_player_show
+ * @access public
+ *
+ * @param array $values
+ *   Config
+ * @param string $context
+ *   What layout you want the player to be
+ * @param int $width
+ *   Width you want the player to be
+ * @param int $height
+ *   height you want the player to be
+ *
+ * @return string
+ *   string to render
+ */
+function nt_player_show($values, $context = 'production_player', $width = 710, $height = 399) {
+  // The player is made up of items.
+  $items = array();
+  // The player is an array of the display 'items' and any additional 'info',
+  // such as item links or descriptions.
+  $player = array();
+
+  // For each item in the player, load the necessary data from the asset node.
+  $items = nt_player_load_items($values, $width, $height);
+  if (!empty($items)) {
+    // Build the player.
+    $player = nt_player_display_items($items, $context, $width, $height);
+  }
+
+  return $player;
+}
+
+/**
+ * nt_player_load_items
+ * @access public
+ *
+ * @param array $values
+ *   Config
+ * @param int $width
+ *   Width you want the player to be
+ * @param int $height
+ *   Height you want the player to be
+ *
+ * @return array
+ *   List of items to render
+ */
+function nt_player_load_items($values, $width, $height) {
+
+  $items = array();
+  $i = 1;
+
+  // Load the nodes.
+  foreach ($values as $value) {
+    // Load the nodes.
+    if (isset($value['nid'])) {
+      $asset_node = node_load($value['nid']);
+    }
+    elseif ($value['target_id']) {
+      $asset_node = $value['entity'];
+    }
+
+    $item = new stdClass();
+    $item->type = $asset_node->type;
+    $item->title = $asset_node->title;
+
+    // NT request to override title for galleries with a display title, if set.
+    if (isset($asset_node->nt_display_title['und'][0]['value'])) {
+      $item->title = $asset_node->nt_display_title['und'][0]['value'];
+    }
+
+    // Depending on node type, collect the necessary data.
+    switch ($asset_node->type) {
+      case 'video':
+        $item->assets = nt_player_load_video($asset_node, $width, $height);
+        break;
+
+      case 'gallery':
+      case 'nt_gallery':
+        $item->assets = nt_player_load_gallery($asset_node, $width, $height);
+        break;
+
+      case 'nt_audio':
+      case 'audio':
+        $item->assets = nt_player_load_audio($asset_node, $width, $height);
+        break;
+
+      case 'image':
+        $item->assets = nt_player_load_image($asset_node, $width, $height);
+        break;
+
+      default:
+        $item->assets = FALSE;
+        watchdog(
+          'NT_PLAYER',
+          'Asset type not matched<pre>' . print_r($asset_node, TRUE) . '</pre>'
+        );
+    }
+    if ($item->assets) {
+      module_invoke_all('nt_player_data', $item, $asset_node);
+      $items[$i] = $item;
+      $i++;
+    }
+    unset($item);
+  }
+
+  return $items;
+}
+
+/**
+ * nt_player_display_items
+ * @access public
+ *
+ * @param array $items
+ *   Items to render
+ * @param string $context
+ *   Type if layout
+ * @param int $width
+ *   Width you want the player to be
+ * @param int $height
+ *   Height you want the player to be
+ *
+ * @return array
+ *   Player render array
+ */
+function nt_player_display_items($items, $context, $width, $height) {
+  global $base_url;
+  $player = array();
+
+  // PRODUCTION PAGE.
+  if ($context == 'production_player') {
+
+    // The player links and the player assets are divided into separate areas of
+    // the design so will split them into a two part array.
+    $links = nt_player_load_item_links($items);
+
+    // Display the links.
+    $player['links'] = nt_player_display_item_links($links);
+
+    // This var determines which of the player items is displayed.
+    $play = (isset($_GET['play'])) ? $_GET['play'] : 1;
+
+    // Display the selected item.
+    switch ($items[$play]->type) {
+      case 'video':
+        $player['items'] = nt_player_display_video(
+          $items[$play]->assets,
+          $width,
+          $height,
+          1
+        );
+        break;
+
+      case 'gallery':
+      case 'nt_gallery':
+        drupal_add_js(
+          array(
+            'nt_player' => array(
+              'width' => $width,
+              'height' => $height,
+              'swf' => $base_url . '/' . drupal_get_path('module', 'nt_player')
+              . '/swf/',
+            ),
+          ),
+          'setting'
+        );
+        $player['items'] = nt_player_display_gallery($items[$play]->assets, $width, $height);
+        break;
+
+      case 'audio':
+      case 'nt_audio':
+        $player['items'] = nt_player_display_video($items[$play]->assets, $width, $height, 1);
+        break;
+
+      case 'image':
+        $player['items'] = nt_player_display_image($items[$play]->assets, $width, $height);
+        break;
+    }
+  }
+  // NT CHANNEL.
+  elseif ($context == 'nt_channel') {
+    $id = 1;
+    $player['items'] = '';
+    foreach ($items as $item) {
+      $player['items'] .= '<li>' . nt_player_display_video($item->assets, $width, $height, $id);
+      $player['items'] .= nt_player_display_video_info($item->assets) . '</li>';
+      $id++;
+    }
+  }
+  elseif ($context == 'basic_page') {
+    foreach ($items as $item) {
+      $player['items'] .= nt_player_display_video($item->assets, $width, $height, 1);
+    }
+  }
+  return $player;
+}
+
+/**
+ * nt_player_display_item_links
+ *
+ * @param string $links
+ *   Links to add to navigation
+ *
+ * @return string
+ *   Render the navigation
+ */
+function nt_player_display_item_links($links) {
+  return '
+    <nav class="nav-sub">
+      <ul>' .
+          $links .
+          '</ul>
+    </nav>';
+}
+/**
+ * nt_player_load_item_links
+ *
+ * @param array $items
+ *   Items to add to list
+ *
+ * @return string
+ *   List string to render
+ */
+function nt_player_load_item_links($items) {
+  $links = '';
+  $i = 1;
+  $current = isset($_GET['play']) ? $_GET['play'] : 1;
+
+  foreach ($items as $item) {
+    $attributes = ($i == $current) ? array('class' => array('active')) : array();
+    $links .= '<li>' . l($item->title, drupal_get_path_alias($_GET['q']), array('query' => array('play' => $i), 'attributes' => $attributes)) . '</li>';
+    $i++;
+  }
+  return $links;
+}
+/**
+ * nt_player_load_image
+ *
+ * @param stdClass $asset_node
+ *   Image node to work on
+ * @param int $width
+ *   Width you want the player to be
+ * @param int $height
+ *   Height you want the player to be
+ *
+ * @return \stdClass
+ *   image object with credit and path
+ */
+function nt_player_load_image($asset_node, $width, $height) {
+  $image = new stdClass();
+  _nt_player_check_style($width . 'x' . $height . '-prod_page');
+  $image->path = file_create_url(
+    image_style_path(
+      $width . 'x' . $height . '-prod_page',
+      $asset_node->nt_image_image[LANGUAGE_NONE][0]['uri']
+    )
+  );
+  if (!empty($asset_node->nt_credits)) {
+    $image->credit = $asset_node->nt_credits[LANGUAGE_NONE][0]['value'];
+  }
+  else {
+    $image->credit = '';
+  }
+  module_invoke_all('nt_player_image_data', $image, $asset_node);
+  return $image;
+}
+
+/**
+ * nt_player_display_image
+ *
+ * @param stdClass $image
+ *   Image node to render
+ * @param int $width
+ *   Width you want the player to be
+ * @param int $height
+ *   Height you want the player to be
+ *
+ * @return string
+ *   Render image string
+ */
+function nt_player_display_image($image, $width, $height) {
+  return '<div id="galleryshow">
+	    <img src="' . $image->path . '" alt="" width="' . $width . '" height="' . $height . '"><span class="credit">' . $image->credit . '</span>
+	  </div>';
+}
+/**
+ * nt_player_load_gallery
+ *
+ * @param stdClass $gallery_node
+ *   Image node
+ * @param int $width
+ *   Width you want the player to be
+ * @param int $height
+ *   Height you want the player to be
+ *
+ * @return array
+ *   Gallery to render
+ */
+function nt_player_load_gallery($gallery_node, $width, $height) {
+
+  $i = 0;
+  $gallery_items = array();
+
+  // Load each gallery item.
+  if (isset($gallery_node->nt_gallery_items[LANGUAGE_NONE])) {
+    $gallery_node->nt_gallery_items
+      = $gallery_node->nt_gallery_items[LANGUAGE_NONE];
+  }
+  foreach ($gallery_node->nt_gallery_items as $asset) {
+    // Load the nodes.
+    if (isset($asset['target_id'])) {
+      $nid = $asset['target_id'];
+    }
+    else {
+      $nid = $asset['nid'];
+    }
+    $asset_node = node_load($nid);
+
+    if ($asset_node->status == 1) {
+
+      // First item in the gallery gets printed like a single main item.
+      if ($i == 0) {
+        if ($asset_node->type == 'image') {
+          $image = nt_player_load_image($asset_node, $width, $height);
+          $gallery_items['first_item'] = nt_player_display_image($image, $width, $height);
+        }
+        elseif ($asset_node->type == 'audio' || $asset_node->type == 'nt_audio') {
+          $video = nt_player_load_audio($asset_node, $width, $height);
+          $gallery_items['first_item'] = '<div id="galleryshow">'
+          . nt_player_display_video($video, $width, $height, 1)
+          . '</div>';
+        }
+        else {
+          $video = nt_player_load_video($asset_node, $width, $height);
+          $gallery_items['first_item'] = '<div id="galleryshow">'
+          . nt_player_display_video($video, $width, $height, 1)
+          . '</div>';
+        }
+      }
+      if (!isset($gallery_items['listed_items'])) {
+        $gallery_items['listed_items'] = '';
+      }
+      // All items get listed.
+      if ($asset_node->type == 'image') {
+        $image_render = new stdClass();
+        _nt_player_check_style($width . 'x' . $height . '-prod_page');
+        if (!empty($asset_node->nt_image_image)) {
+          $image_path = file_create_url(
+            image_style_path(
+              $width . 'x' . $height . '-prod_page',
+              $asset_node->nt_image_image[LANGUAGE_NONE][0]['uri']
+            )
+          );
+        }
+        else {
+          $image_path = 'Image Broke';
+        }
+
+        if (!empty($asset_node->nt_credits)) {
+          $credit = $asset_node->nt_credits[LANGUAGE_NONE][0]['value'];
+        }
+        else {
+          $credit = '';
+        }
+        $asset_node_processed = $asset_node;
+        $asset_node_processed->credit = $credit;
+        $asset_node_processed->image_path = $image_path;
+        module_invoke_all('nt_player_gallery_item_data', $asset_node_processed, $asset_node);
+        $image_render->output =
+          '<li><a href="' . $asset_node_processed->image_path . '" rel="' . $asset_node_processed->image_path .
+          '" class="image"><img src="' . $asset_node_processed->image_path .
+          '" alt="" width="91" height="51"><span>' . $asset_node_processed->credit . '</span></a></li>';
+        module_invoke_all('nt_player_gallery_item_view', $image_render, $asset_node_processed);
+        $gallery_items['listed_items'] .= $image_render->output;
+      }
+      elseif ($asset_node->type == 'video' || $asset_node->type == 'nt_video') {
+        $video_render = new stdClass();
+        $asset_node_processed = nt_player_load_video($asset_node, $width, $height);
+        module_invoke_all('nt_player_gallery_item_data', $asset_node_processed, $asset_node);
+        $video_render->output = '<li><a href="' . array_shift($asset_node_processed->urls)
+          . '" rel="' . $asset_node_processed->poster . '" '
+          . 'source="' . array_shift($asset_node_processed->urls)
+                . '" class="video"><img src="' . $asset_node_processed->poster
+                . '" alt="" width="91" height="51"><span>' . $asset_node_processed->title
+                . '</span></a></li>';
+        $asset_node_processed->urls = $asset_node_processed->urls_list;
+        module_invoke_all('nt_player_gallery_item_view', $video_render, $asset_node_processed);
+        $gallery_items['listed_items'] .= $video_render->output;
+      }
+      elseif ($asset_node->type == 'audio' || $asset_node->type == 'nt_audio') {
+        // If this is a CMS-uploaded video then must be mp4.
+        $audio_render = new stdClass();
+        $asset_node_processed = nt_player_load_audio($asset_node, $width, $height);
+        module_invoke_all('nt_player_gallery_item_data', $asset_node_processed, $asset_node);
+        $audio_render->output = '<li><a href="' . $asset_node_processed->urls['mp3']
+          . '" rel="' . $asset_node_processed->poster . '" '
+          . 'source="' . $asset_node_processed->urls['ogg']
+                . '" class="audio"><img src="' . $asset_node_processed->poster
+                . '" alt="" width="91" height="51"><span>' . $asset_node_processed->title
+                . '</span></a></li>';
+        module_invoke_all('nt_player_gallery_item_view', $audio_render, $asset_node_processed);
+        $gallery_items['listed_items'] .= $audio_render->output;
+      }
+
+      $i++;
+    }
+  }
+  $invoke_results = module_invoke_all(
+    'nt_player_gallery_data',
+    $gallery_items,
+    $gallery_node
+  );
+  if (empty($invoke_results)) {
+    $invoke_results = $gallery_items;
+  }
+  return $invoke_results;
+}
+
+/**
+ * nt_player_display_gallery
+ *
+ * @param array $gallery_items
+ *   Gallery items to render
+ *
+ * @return string
+ *   Gallery list to render
+ */
+function nt_player_display_gallery($gallery_items) {
+  return
+    $gallery_items['first_item'] .
+          '
+    <div id="gallery" class="box-black box-padding2 clearfix">
+  
+      <!-- for images use src of large image in rel attr. for videos use the filename used across all file types -->
+      <ul class="noslide">' .
+          $gallery_items['listed_items'] .
+          '</ul>
+    
+    </div>';
+}
+
+/**
+ * nt_player_load_video
+ *
+ * @param stdClass $asset_node
+ *   Node to render
+ * @param int $width
+ *   Width you want the player to be
+ * @param int $height
+ *   Height you want the player to be
+ *
+ * @return \stdClass
+ *   Update node with poster and thumbnail
+ */
+function nt_player_load_video($asset_node, $width, $height) {
+  $video = new stdClass();
+
+  // Video links.
+  $video->urls = nt_player_get_video_urls($asset_node, $width, $height);
+  $video->urls_list = $video->urls;
+  $video->type = $asset_node->type;
+  // Poster image.
+  if (isset($asset_node->nt_video_thumb[LANGUAGE_NONE][0]['target_id'])) {
+    $thumb_node = node_load($asset_node->nt_video_thumb[LANGUAGE_NONE][0]['target_id']);
+  }
+  else {
+    $thumb_node = 'nt-player://' . drupal_get_path('module', 'nt_player') . '/images/video.jpg';
+  }
+  $video_processed = _nt_player_load_asset($video, $thumb_node, $asset_node, $width, $height);
+  module_invoke_all('nt_player_video_data', $video_processed, $asset_node);
+  return $video_processed;
+}
+
+/**
+ * nt_player_load_audio
+ *
+ * @param stdClass $asset_node
+ *   Node to render
+ * @param int $width
+ *   Width you want the player to be
+ * @param int $height
+ *   Height you want the player to be
+ *
+ * @return \stdClass
+ *   Update node with poster and thumbnail
+ */
+function nt_player_load_audio($asset_node, $width, $height) {
+  $audio = new stdClass();
+  $audio->type = 'nt_audio';
+  // Audio links.
+  $audio->urls = nt_player_get_audio_urls($asset_node, $width, $height);
+  $audio->urls_list = $audio->urls;
+  // Poster image.
+  if (isset($asset_node->nt_audio_thumb[LANGUAGE_NONE][0]['target_id'])) {
+    $thumb_node = node_load($asset_node->nt_audio_thumb[LANGUAGE_NONE][0]['target_id']);
+  }
+  else {
+    $thumb_node = 'nt-player://' . drupal_get_path('module', 'nt_player') . '/images/audio.jpg';
+  }
+  $audio_processed = _nt_player_load_asset($audio, $thumb_node, $asset_node, $width, $height);
+  module_invoke_all('nt_player_audio_data', $audio_processed, $asset_node);
+  return $audio_processed;
+}
+
+/**
+ * Abstracted code to load NT player assets
+ * @access private
+ *
+ * @param stdClass $asset
+ *   Start of Node to render
+ * @param stdClass $thumb_node
+ *   Thumbnail image
+ * @param stdClass $asset_node
+ *   Node to render data
+ * @param int $width
+ *   Width you want the player to be
+ * @param int $height
+ *   Height you want the player to be
+ *
+ * @return \stdClass
+ *   Update node with poster and thumbnail
+ */
+function _nt_player_load_asset($asset, $thumb_node, $asset_node, $width, $height) {
+  _nt_player_check_style($width . 'x' . $height . '-prod_page');
+  if (is_object($thumb_node)) {
+    $asset->poster = image_style_url($width . 'x' . $height . '-prod_page', $thumb_node->nt_image_image[LANGUAGE_NONE][0]['uri']);
+  }
+  else {
+    $asset->poster = image_style_url($width . 'x' . $height . '-prod_page', $thumb_node);
+  }
+  // Title.
+  $asset->title = $asset_node->title;
+  // Description.
+  $asset->description = '';
+  if (!empty($asset_node->body)) {
+    if (isset($asset_node->body[LANGUAGE_NONE][0]['safe_summary'])
+      && strlen($asset_node->body[LANGUAGE_NONE][0]['safe_summary']) > 1) {
+      $asset->description = $asset_node->body[LANGUAGE_NONE][0]['safe_summary'];
+    }
+    elseif (isset($asset_node->body[LANGUAGE_NONE][0]['safe_value'])) {
+      $asset->description
+        = truncate_utf8(
+          $asset_node->body[LANGUAGE_NONE][0]['safe_value'],
+          200,
+          TRUE,
+          TRUE
+        );
+    }
+  }
+  // Link.
+  $asset->link = drupal_get_path_alias('node/' . $asset_node->nid);
+  return $asset;
+}
+
+/**
+ * nt_player_display_video
+ * @access public
+ *
+ * @param stdClass $video
+ *   Video node to render
+ * @param int $width
+ *   Width you want the player to be
+ * @param int $height
+ *   Height you want the player to be
+ * @param string $id
+ *   Id for the player
+ *
+ * @return string
+ *   Video player string to render
+ */
+function nt_player_display_video($video, $width, $height, $id) {
+  global $base_url;
+  // If this item has been selected in the left hand menu then autoplay.
+  $autoplay = (isset($_GET['play'])) ? 'autoplay' : '';
+  switch ($video->type) {
+    case 'video':
+    case 'nt_video':
+      $urls = _nt_player_get_video_urls_wrapper($video, $width, $height);
+      $swf_url = isset($video->urls['mp4']) ? $video->urls['mp4'] : '';
+      $class = 'video';
+      break;
+
+    case 'audio':
+    case 'nt_audio':
+      $urls = _nt_player_get_audio_urls_wrapper($video, $width, $height);
+      $swf_url = isset($video->urls['mp3']) ? $video->urls['mp3'] : '';
+      $class = 'audio';
+      break;
+
+    default:
+      $urls  = '';
+      $class = '';
+  }
+  $video_html
+    = '<div onclick="_gaq.push([\'_trackPageview\', \'video-plays/' . $video->title . '/' . drupal_get_path_alias('node/' . arg(1)) . '\']);" class="' . $class . '">
+         <video id="player' . $id . '" width="' . $width . '" height="' . $height . '" poster="' . $video->poster . '" controls="controls" preload="none" ' . $autoplay . '>' .
+          $urls .
+          '<!-- Flash fallback for non-HTML5 browsers without JavaScript -->
+             <object width="' . $width . '" height="' . $height . '" type="application/x-shockwave-flash" data="' . file_create_url($base_url . '/' . drupal_get_path('module', 'nt_player') . '/swf/flashmediaelement.swf') . '">
+                <param name="movie" value="' . file_create_url($base_url . '/' . drupal_get_path('module', 'nt_player') . '/swf/flashmediaelement.swf') . '" />
+                <param name="flashvars" value="controls=true&amp;poster=' . $video->poster . '&amp;file=' . $swf_url . '" />
+                <!-- Image as a last resort -->
+                <img src="' . $video->poster . '" width="' . $width . '" height="' . $height . '" title="No video playback capabilities" alt="No video playback capabilities" />
+             </object>
+           </video>
+        </div>';
+  nt_player_addjs('player' . $id);
+  return $video_html;
+}
+
+/**
+ * nt_player_display_video_info
+ * @access public
+ *
+ * @param stdClass $video
+ *   Video file to render
+ *
+ * @return string
+ *   String to render
+ */
+function nt_player_display_video_info($video) {
+  $info_html
+    = '<div class="box-padding">
+	  <h3>' . $video->title . '</h3>
+          <p>' . $video->description . ' <a href="' . $video->link . '">More info</a></p>
+        </div>';
+
+  return $info_html;
+}
+
+/**
+ * nt_player_get_video_urls
+ * @access public
+ *
+ * @param stdClass $video_node
+ *   Video file node to render
+ * @param int $width
+ *   Width you want the player to be
+ * @param int $height
+ *   Height you want the player to be
+ *
+ * @return string
+ *   String to render
+ */
+function nt_player_get_video_urls($video_node, $width, $height) {
+
+  // Anything smaller than 640 x 360 is auto set to a minimum video size for NT
+  // (since this is the smallest video set to be produced by FCS)
+  $video_width = ($width < 640) ? 640 : $width;
+  $video_height = ($height < 360) ? 360 : $height;
+  $output = array();
+
+  // If this is a CMS-uploaded video then must be mp4.
+  if (isset($video_node->nt_video_file[LANGUAGE_NONE][0]['fid'])) {
+    $output['mp4'] = file_create_url($video_node->nt_video_file[LANGUAGE_NONE][0]['uri']);
+  }
+  // Otherwise we need to use RM server as source.
+  else {
+    $filename = $video_node->nt_video_file_url[LANGUAGE_NONE][0]['value'] . '-' . $video_width . 'x' . $video_height;
+    $rich_media_url = variable_get('finalcut_video_directory', 'https://media.nt-online.org/finalcut/video_exports');
+    $video_dirs = array('mp4' => 'MP4', 'webm' => 'WebM');
+
+    $output['mp4'] = $rich_media_url . '/' . $video_dirs['mp4'] . '/' . $filename . '.mp4';
+    $output['webm'] = $rich_media_url . '/' . $video_dirs['webm'] . '/' . $filename . '.webm';
+  }
+  if (isset($video_node->nt_video_srt[LANGUAGE_NONE][0]['filename'])) {
+    $output['subtitles'] = file_create_url($video_node->nt_video_srt[LANGUAGE_NONE][0]['uri']);
+  }
+
+  return $output;
+}
+/**
+ * nt_player_get_video_urls_wrapper
+ * @access private
+ *
+ * @param stdClass $video_node
+ *   Video file node to render
+ * @param int $width
+ *   Width you want the player to be
+ * @param int $height
+ *   Height you want the player to be
+ *
+ * @return string
+ *   String to render
+ */
+function _nt_player_get_video_urls_wrapper($video_node, $width, $height) {
+  if (isset($video_node->urls) && is_array($video_node->urls) && !empty($video_node->urls)) {
+    $url = $video_node->urls;
+  }
+  else {
+    $url = nt_player_get_video_urls($video_node, $width, $height);
+  }
+  $output = '';
+  if (isset($url['mp4'])) {
+    $output .= '<!-- MP4 for Safari, IE9, iPhone, iPad, Android, and Windows Phone 7 -->
+		  <source type="video/mp4" src="' . $url['mp4'] . '" />';
+  }
+  if (isset($url['webm'])) {
+    $output .= '<!-- WebM/VP8 for Firefox4, Opera, and Chrome -->
+		  <source type="video/webm" src="' . $url['webm'] . '" />';
+  }
+  if (isset($url['subtitles'])) {
+    $output .= '<!-- Optional: Add subtitles for each language -->
+		<track kind="subtitles" src="' . $url['subtitles'] . '" srclang="en" />';
+    // $output .= '<!-- Optional: Add subtitles for each language -->
+    // <track kind="subtitles" src="/sites/all/libraries/files/video/'.
+    // $video_node->nt_video_srt[LANGUAGE_NONE][0]['filename'].
+    // '" srclang="en" />';
+  }
+  return $output;
+}
+/**
+ * nt_player_get_audio_urls
+ * @access public
+ *
+ * @param stdClass $audio_node
+ *   Video file node to render
+ * @param int $width
+ *   Width you want the player to be
+ * @param int $height
+ *   Height you want the player to be
+ *
+ * @return string
+ *   String to render
+ */
+function nt_player_get_audio_urls($audio_node, $width, $height) {
+  $output = array();
+  if (isset($audio_node->nt_audio_file[LANGUAGE_NONE][0]['fid'])) {
+    $output['mp3'] = file_create_url($audio_node->nt_audio_file[LANGUAGE_NONE][0]['uri']);
+  }
+  else {
+    if (isset($audio_node->nt_audio_file_url[LANGUAGE_NONE][0]['value'])) {
+      $filename = $audio_node->nt_audio_file_url[LANGUAGE_NONE][0]['value'];
+    }
+    else {
+      $filename = 'test';
+    }
+    $rich_media_url = variable_get('finalcut_audio_directory', 'https://media.nt-online.org/finalcut/audio_exports');
+    $audio_dirs = array('mp3' => 'MP3', 'ogg' => 'OGG');
+    $output['mp3'] = $rich_media_url . '/' . $audio_dirs['mp3'] . '/' . $filename . '.mp3';
+    $output['ogg'] = $rich_media_url . '/' . $audio_dirs['ogg'] . '/' . $filename . '.ogg';
+  }
+  return $output;
+}
+/**
+ * nt_player_get_audio_urls_wrapper
+ * @access private
+ *
+ * @param stdClass $audio_node
+ *   Video file node to render
+ * @param int $width
+ *   Width you want the player to be
+ * @param int $height
+ *   Height you want the player to be
+ *
+ * @return string
+ *   String to render
+ */
+function _nt_player_get_audio_urls_wrapper($audio_node, $width, $height) {
+  if (isset($audio_node->urls) && is_array($audio_node->urls) && !empty($audio_node->urls)) {
+    $url = $audio_node->urls;
+  }
+  else {
+    $url = nt_player_get_audio_urls($audio_node, $width, $height);
+  }
+  $output = '';
+  if (isset($url['mp3'])) {
+    $output .= '<!-- MP4 for Safari, IE9, iPhone, iPad, Android, and Windows Phone 7 -->
+	       <source type="audio/mp3" src="' . $url['mp3'] . '" />';
+  }
+  if (isset($url['ogg'])) {
+    $output .= '<!-- WebM/VP8 for Firefox4, Opera, and Chrome -->
+		  <source type="audio/ogg" src="' . $url['ogg'] . '" />';
+  }
+  return $output;
+}
+/**
+ * Make sure the image style exist
+ * @access private
+ *
+ * @param string $style
+ *   Image Style to be checked
+ */
+function _nt_player_check_style($style) {
+  $check = image_style_load($style);
+  if (empty($check)) {
+    $image_style = array(
+      'name' => $style,
+    );
+    $image_style = image_style_save($image_style);
+
+    list($width, $rest) = explode('x', $style);
+    list($height,) = explode('-', $rest);
+
+    $effect = array();
+    $effect['isid'] = $image_style['isid'];
+    $effect['weight'] = 1;
+    $effect['name'] = 'image_scale';
+    $effect['data'] = array(
+      'width' => $width,
+      'height' => $height,
+      'upscale' => 0,
+    );
+    image_effect_save($effect);
+  }
+}
+/**
+ * Implements hook_stream_wrappers().
+ *
+ * @return array
+ *   A nested array, keyed first by scheme name ("public" for "public://")
+ */
+function nt_player_stream_wrappers() {
+  return array(
+    'nt-player' => array(
+      'name' => t('NT Player wrapper for its local images'),
+      'class' => 'NTPlayerPublicStreamWrapper',
+      'description' => t('NT Player has some default images to use with image_styles.
+        May be over kill but it works and is a start for FinalCut server wrapper.'),
+      'type' => STREAM_WRAPPERS_READ_VISIBLE,
+    ),
+  );
+}
+/**
+ * Provides stream wrapper class for access NT Player default images for
+ * resizing.
+ *
+ * Provides support for storing publicly accessible files with the Drupal file
+ * interface.
+ */
+class NTPlayerPublicStreamWrapper extends DrupalLocalStreamWrapper {
+  /**
+   * Gets the Directory Path.
+   * For this we default to the public files for image cache purposes.
+   *
+   * @return string
+   *   File path
+   */
+  public function getDirectoryPath() {
+    return variable_get('file_public_path', conf_path() . '/files');
+  }
+  /**
+   * Get External Url path
+   *
+   * @return string
+   *   External Url path
+   */
+  public function getExternalUrl() {
+    $path = str_replace('\\', '/', $this->getTarget());
+    if (strpos($this->uri, 'nt-player://styles/') !== FALSE) {
+      return $GLOBALS['base_url'] . '/' . self::getDirectoryPath() . '/' . drupal_encode_path($path);
+    }
+    else {
+      return $GLOBALS['base_url'] . '/' . drupal_get_path('module', 'nt_player') . '/' . drupal_encode_path($path);
+    }
+  }
+  /**
+   * Returns the canonical absolute path of the URI, if possible.
+   * This is where the magic happens, in that for call to non style the module
+   * path is returned, and for style it returns the public files dir
+   *
+   * @param string $uri
+   *   (optional) The stream wrapper URI to be converted to a canonical
+   *   absolute path. This may point to a directory or another type of file.
+   *
+   * @return string|false
+   *   If $uri is not set, returns the canonical absolute path of the URI
+   *   previously set by the DrupalStreamWrapperInterface::setUri() function.
+   *   If $uri is set and valid for this class, returns its canonical absolute
+   *   path, as determined by the realpath() function. If $uri is set but not
+   *   valid, returns FALSE.
+   */
+  protected function getLocalPath($uri = NULL) {
+    if (!isset($uri)) {
+      $uri = $this->uri;
+    }
+    if (strpos($uri, 'nt-player://styles/') !== FALSE) {
+      $uri = str_replace('nt-player:', 'public:', $uri);
+      $path = $this->getDirectoryPath() . '/' . $this->getTarget($uri);
+      $realpath = realpath($path);
+
+      if (!$realpath) {
+        // This file does not yet exist.
+        $realpath = realpath(dirname($path)) . '/' . drupal_basename($path);
+      }
+      $directory = realpath($this->getDirectoryPath());
+      if (!$realpath || !$directory || strpos($realpath, $directory) !== 0) {
+        return FALSE;
+      }
+    }
+    else {
+      $realpath = DRUPAL_ROOT . '/' . $this->getTarget($uri);
+    }
+    return $realpath;
+  }
+}
